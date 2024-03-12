@@ -1,90 +1,74 @@
-import csv
-import pulp
 from datetime import datetime
 
+from pulp import LpMaximize, LpProblem, LpVariable, lpSum, PULP_CBC_CMD
+import pulp
+import pandas as pd
+import pulp
 
+# Initialize the problem
 def main():
-    # Read input data from the CSV file
-    budgetGiven = 105093308
-    input_data = []
-    with open('./data/Data_max_min - 30DayLpData.csv', 'r') as file:
-        reader = csv.DictReader(file)
-        for row in reader:
-            minUnits = max(int(int(row['no_of_units']) * 0.5), 1)  # Adjusted minUnits calculation
-            input_data.append({
-                'warehouse_id': int(row['warehouse_id']),
-                'sku': row['sku'],
-                'profit_per_quantity': float(row['profit_per_quantity']),
-                'lp': float(row['lp']),
-                'no_of_units': int(row['no_of_units']),  # Simplified conversion
-                'total_profit_per_sku': float(row['total_profit_per_sku']),
-                'max_units': int(int(row['no_of_units']) * 1.5),
-                'min_units': minUnits,
-            })
+    print("main")
+    problem = LpProblem("Maximize_Total_Profit", LpMaximize)
+    csv_file_path = './data/Data_max_min - output.csv'
+    df = pd.read_csv(csv_file_path)
+    print(df['no_of_units'])
 
-    # Create a LP problem
-    prob = pulp.LpProblem("Maximize_Total_Profit", pulp.LpMaximize)
+    # Decision variables: Number of units for each SKU, cannot be negative
+    # Using SKU names as variable identifiers for clarity
+    unit_vars = {
+        row['sku_id']: LpVariable(f'units_{row['sku_id']}', lowBound=row['min_units'], upBound=row['max_units'], cat='Integer')
+        for index, row in df.iterrows()
+    }
+    # Objective Function: Maximize total profit
+    problem += lpSum([row['profit_per_quantity'] * unit_vars[row['sku_id']] for index, row in df.iterrows()])
 
-    # Define decision variables
-    variables = pulp.LpVariable.dicts("Quantity:", [(row['sku'], row['warehouse_id']) for row in input_data],
-                                      lowBound=0, cat='Integer')
+    # Calculate 10% of the budget for tolerance
+    budget = calculate_total_spent(df)
+    print("budget: " + str(budget))
+    tolerance_limit = 0.001 * budget
 
-    # Add objective function
-    prob += pulp.lpSum([row['profit_per_quantity'] * variables[(row['sku'], row['warehouse_id'])] for row in input_data]), "Total_Profit"
+    # Slack variable for tolerance
+    slack = LpVariable("slack", lowBound=-tolerance_limit, upBound=tolerance_limit)
 
-    # Add constraints
-    for row in input_data:
-        prob += variables[(row['sku'], row['warehouse_id'])] >= row['min_units'], f"Min_Units_{row['sku']}_{row['warehouse_id']}"
-        prob += variables[(row['sku'], row['warehouse_id'])] <= row['max_units'], f"Max_Units_{row['sku']}_{row['warehouse_id']}"
+    # Objective Function: Maximize total profit
+    problem += lpSum([row['lp'] * unit_vars[row['sku_id']] for index, row in df.iterrows()])+ slack == budget
 
-    # Add budget constraint
-    prob += pulp.lpSum([row['lp'] * variables[(row['sku'], row['warehouse_id'])] for row in input_data]) <= budgetGiven, "Budget_Constraint"
+    # Add constraints to ensure that optimal_units are within the min and max unit limits
+    for index, row in df.iterrows():
+        problem += unit_vars[row['sku_id']] >= row['min_units']
+        problem += unit_vars[row['sku_id']] <= row['max_units']
+
+    min_units_cost = sum(row['min_units'] * row['lp'] for index, row in df.iterrows())
+    if min_units_cost > budget:
+        raise ValueError("The budget is insufficient to cover the minimum required units for all SKUs.")
+
+    print("starting optimization")
 
     # Solve the problem
-    prob.solve()
+    # pulp.solvers.PULP_CBC_CMD(maxSeconds=60).solve(problem)
+    problem.solve(PULP_CBC_CMD(timeLimit=1))
 
-    sum_total_profit = sum(row['profit_per_quantity'] * v.varValue for row, v in zip(input_data, prob.variables()))
-    sum_total_budget = sum(row['lp'] * v.varValue for row, v in zip(input_data, prob.variables()))
+    # Extract the solution
+    optimal_units = {sku: var.value() for sku, var in unit_vars.items()}
 
-    current_datetime = datetime.now().strftime('%Y-%m-%d_%H-%M-%S')
-    output_file = f'./output/output_{current_datetime}.csv'
+    df['Optimal_Units'] = df['sku_id'].apply(lambda x: optimal_units.get(x, 0))
+    df['Optimal_Profit_Per_SKU'] = df['profit_per_quantity'] * df['Optimal_Units']
 
-
-    # Write input data and then append the output data to output.csv
-    # Write input data and then append the output data to output.csv
-    with open(output_file, 'a', newline='') as file:
-        fieldnames = ['sku', 'warehouse_id', 'lp', 'no_of_units', 'max_units', 'min_units', 'quantity']
-        writer = csv.DictWriter(file, fieldnames=fieldnames)
-
-        # Write input data
-        if file.tell() == 0:  # Check if file is empty
-            writer.writeheader()
-        for row, v in zip(input_data, prob.variables()):
-            sku, warehouse_id = row['sku'], row['warehouse_id']
-            writer.writerow({
-                'sku': sku,
-                'warehouse_id': warehouse_id,
-                'lp': row['lp'],
-                'no_of_units': row['no_of_units'],
-                'max_units': row['max_units'],
-                'min_units': row['min_units'],
-                'quantity':variables[(sku, warehouse_id)].varValue,  # Output quantity if it's greater than 0
-            })
-        writer.writerow({
-            'sku': 0,
-            'warehouse_id': f'give-budget:{budgetGiven}, total-budget-used:{sum_total_budget}, budget-overspend: {sum_total_budget-budgetGiven}, total-profit-got:{sum_total_profit},',
-        })
+    optimal_total_profit = sum(row['profit_per_quantity'] * optimal_units[row['sku_id']] for index, row in df.iterrows())
+    current_date_time = datetime.now()
+    updated_file_path = f'./output/output-{current_date_time}.csv'
+    df.to_csv(updated_file_path, index=False)
+    print("budget left:", calculate_new_spent(df)-calculate_total_spent(df))
+    print("updated profit gitten:", (df['profit_per_quantity']*df['Optimal_Units']).sum()-(df['no_of_units'] * df['profit_per_quantity']).sum())
+    print("Status:", pulp.LpStatus[problem.status])
 
 
-    # Debugging Constraints
-    for row in input_data:
-        sku, warehouse_id = row['sku'], row['warehouse_id']
-        decision_variable = variables[(sku, warehouse_id)]
-        print(f"SKU: {sku}, Warehouse ID: {warehouse_id}, Decision Variable: {decision_variable.varValue}, Max Units: {row['max_units']}, Min units: {row['min_units']}")
+def calculate_total_spent(df):
+    return (df['no_of_units'] * df['lp']).sum()
 
-    print("Sum of Total Profit:", sum_total_profit)
-    print("Sum of Total budget:", sum_total_budget)
-
+def calculate_new_spent(df):
+    return (df['Optimal_Units'] * df['lp']).sum()
 
 if __name__ == "__main__":
     main()
+
